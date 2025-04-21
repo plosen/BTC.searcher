@@ -1,0 +1,12 @@
+requests
+hashlib
+os
+time
+random
+re
+concurrent.futures
+bitcoinutils
+logging
+datetime
+colorama
+eth-account
