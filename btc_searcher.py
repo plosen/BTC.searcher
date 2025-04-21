@@ -1,0 +1,690 @@
+import requests
+import hashlib
+import os
+import time
+import random
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from bitcoinutils.setup import setup
+from bitcoinutils.keys import PrivateKey
+import logging
+from datetime import datetime
+from colorama import init, Fore, Back, Style
+from eth_account import Account
+
+# Initialize colored output
+init(autoreset=True)
+
+# Configuration
+ETHERSCAN_API = "VHKK3E9HXG6VP7HIPN3J1THQ3QCBDI6XV3"
+PROGRESS_FILE = "scan_progress.txt"
+REQUEST_TIMEOUT = 20  # Increased timeout for all requests
+MAX_RETRIES = 3  # Maximum number of request attempts
+
+# Proxy configuration (can be disabled in menu)
+PROXY_ENABLED = True
+my_proxies = {
+    'http': 'http://Sn4hZU91:cUx21UGV@45.139.31.32:63322',
+    'https': 'http://Sn4hZU91:cUx21UGV@45.139.31.32:63322',
+}
+
+def get_request_session():
+    """Create a session with proxy settings and timeouts"""
+    session = requests.Session()
+    if PROXY_ENABLED:
+        session.proxies = my_proxies
+    session.mount('http://', requests.adapters.HTTPAdapter(
+        max_retries=MAX_RETRIES,
+        pool_connections=20,
+        pool_maxsize=100))
+    session.mount('https://', requests.adapters.HTTPAdapter(
+        max_retries=MAX_RETRIES,
+        pool_connections=20,
+        pool_maxsize=100))
+    return session
+
+def save_progress(position, filename):
+    """Save current position in file"""
+    with open(PROGRESS_FILE, 'w') as f:
+        f.write(f"{filename}|{position}")
+
+def load_progress():
+    """Load last position from file"""
+    if os.path.exists(PROGRESS_FILE):
+        with open(PROGRESS_FILE, 'r') as f:
+            content = f.read().strip()
+            if '|' in content:
+                filename, position = content.split('|')
+                return filename, int(position)
+    return None, 0
+
+def extract_addresses_from_file(file_path):
+    """Extract BTC addresses from file with balances"""
+    addresses = []
+    try:
+        with open(file_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                match = re.search(r'(?:Address:\s*)?(1[a-km-zA-HJ-NP-Z1-9]{25,34}|3[a-km-zA-HJ-NP-Z1-9]{25,34}|bc1[a-z0-9]{39,59})', line)
+                if match:
+                    address = match.group(1)
+                    addresses.append(address)
+                    
+        return addresses
+    
+    except Exception as e:
+        logging.error(f"File read error: {str(e)}")
+        return []
+
+def get_user_input():
+    """Interactive parameter input with menu"""
+    global PROXY_ENABLED
+    
+    print(Fore.CYAN + "\n" + "="*50)
+    print(Fore.YELLOW + "SCAN PARAMETERS CONFIGURATION")
+    print(Fore.CYAN + "="*50 + Style.RESET_ALL)
+    
+    # Additional settings menu
+    print(Fore.MAGENTA + "\nAdditional settings:")
+    print(Fore.CYAN + "1. Enable/disable proxy (current state: {'ON' if PROXY_ENABLED else 'OFF'})")
+    print(Fore.CYAN + "2. Continue with main settings")
+    
+    choice = input(Fore.GREEN + "Select action (1-2): ")
+    if choice == '1':
+        PROXY_ENABLED = not PROXY_ENABLED
+        print(Fore.YELLOW + f"Proxy is now {'enabled' if PROXY_ENABLED else 'disabled'}")
+    
+    mode = input(Fore.GREEN + "\nSelect mode (1 - block scanning, 2 - process file with BTC addresses, 3 - manual hash input): ")
+    
+    if mode == '1':
+        block_range = input(Fore.GREEN + "Enter block range (e.g. '100-200' or '100,150,200'): ")
+        
+        if '-' in block_range:
+            start_block, end_block = map(int, block_range.split('-'))
+            blocks = list(range(start_block, end_block + 1))
+        elif ',' in block_range:
+            blocks = list(map(int, block_range.split(',')))
+        else:
+            blocks = [int(block_range)]
+            
+        params = {
+            'mode': 'blocks',
+            'blocks': blocks,
+            'MAX_WORKERS': int(input(Fore.GREEN + "Number of threads (1-10, default 3): ") or 3),
+            'BASE_DELAY': float(input(Fore.GREEN + "Delay between requests (0.5-5 sec, default 1.5): ") or 1.5),
+            'SCAN_MEMPOOL': input(Fore.GREEN + "Scan mempool (y/n, default n): ").lower() == 'y'
+        }
+        
+    elif mode == '2':
+        file_path = input(Fore.GREEN + "Enter path to file with BTC addresses: ")
+        if not os.path.exists(file_path):
+            print(Fore.RED + "File not found!")
+            exit()
+            
+        progress_file, progress_pos = load_progress()
+        resume = False
+        if progress_file == os.path.abspath(file_path):
+            resume = input(Fore.YELLOW + f"Found saved position ({progress_pos}). Continue from this point? (y/n): ").lower() == 'y'
+            
+        params = {
+            'mode': 'address_file',
+            'file_path': file_path,
+            'resume': resume,
+            'resume_pos': progress_pos if resume else 0,
+            'MAX_WORKERS': int(input(Fore.GREEN + "Number of threads (1-10, default 3): ") or 3),
+            'BASE_DELAY': float(input(Fore.GREEN + "Delay between requests (0.5-5 sec, default 1.5): ") or 1.5)
+        }
+        
+    elif mode == '3':
+        custom_hash = input(Fore.GREEN + "Enter hash for key generation: ")
+        params = {
+            'mode': 'custom',
+            'custom_hash': custom_hash
+        }
+    else:
+        print(Fore.RED + "Invalid mode!")
+        exit()
+    
+    # Input validation
+    if 'MAX_WORKERS' in params:
+        params['MAX_WORKERS'] = max(1, min(10, params['MAX_WORKERS']))
+    if 'BASE_DELAY' in params:
+        params['BASE_DELAY'] = max(0.5, min(5.0, params['BASE_DELAY']))
+    
+    return params
+
+def print_config(config):
+    """Print current configuration"""
+    print(Fore.CYAN + "\n" + "="*50)
+    print(Fore.YELLOW + "CURRENT CONFIGURATION:")
+    print(Fore.CYAN + "="*50)
+    for key, value in config.items():
+        print(Fore.GREEN + f"{key}: {Fore.WHITE}{value}")
+    print(Fore.CYAN + "="*50 + Style.RESET_ALL)
+    
+    if config.get('mode') != 'custom' and input(Fore.YELLOW + "\nStart scanning? (y/n): ").lower() != 'y':
+        exit()
+
+def print_banner():
+    """Fancy greeting"""
+    print(Fore.CYAN + """
+    ██████╗ ████████╗ ██████╗     ██╗  ██╗ ██████╗ ████████╗
+    ██╔══██╗╚══██╔══╝██╔════╝     ██║  ██║██╔═══██╗╚══██╔══╝
+    ██████╔╝   ██║   ██║  ███╗    ███████║██║   ██║   ██║   
+    ██╔══██╗   ██║   ██║   ██║    ██╔══██║██║   ██║   ██║   
+    ██████╔╝   ██║   ╚██████╔╝    ██║  ██║╚██████╔╝   ██║   
+    ╚═════╝    ╚═╝    ╚═════╝     ╚═╝  ╚═╝ ╚═════╝    ╚═╝   
+    """)
+
+def setup_logging():
+    """Configure logging"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(message)s',
+        handlers=[logging.StreamHandler()]
+    )
+
+def check_btc_balance(address):
+    """Check Bitcoin balance with optimized requests"""
+    session = get_request_session()
+    try:
+        # Use lighter API method
+        url = f"https://blockchain.info/balance?active={address}"
+        response = session.get(url, timeout=REQUEST_TIMEOUT).json()
+        if address in response:
+            balance = response[address]['total_received']
+            return balance, balance > 0
+        return 0, False
+            
+    except Exception as e:
+        logging.error(f"Bitcoin balance check error: {str(e)}")
+        return 0, False
+
+def check_eth_balance(address):
+    """Check Ethereum balance with optimized requests"""
+    session = get_request_session()
+    try:
+        # Use batch request to reduce load
+        url = f"https://api.etherscan.io/api?module=account&action=balancemulti&address={address}&tag=latest&apikey={ETHERSCAN_API}"
+        response = session.get(url, timeout=REQUEST_TIMEOUT).json()
+        
+        if response['status'] == '1' and len(response['result']) > 0:
+            balance_wei = int(response['result'][0]['balance'])
+            return balance_wei, balance_wei > 0
+        return 0, False
+            
+    except Exception as e:
+        logging.error(f"Ethereum balance check error: {str(e)}")
+        return 0, False
+
+def check_balances(key_info):
+    """Check BTC and ETH balances"""
+    results = {
+        'btc': {'balance': 0, 'found': False},
+        'eth': {'balance': 0, 'found': False}
+    }
+    
+    btc_balance, btc_found = check_btc_balance(key_info['btc']['address'])
+    results['btc']['balance'] = btc_balance
+    results['btc']['found'] = btc_found
+    
+    eth_balance, eth_found = check_eth_balance(key_info['eth']['address'])
+    results['eth']['balance'] = eth_balance
+    results['eth']['found'] = eth_found
+    
+    return results
+
+def save_result(data, balances):
+    """Save results to file"""
+    if not os.path.exists('results'):
+        os.makedirs('results')
+    
+    found = balances['btc']['found'] or balances['eth']['found']
+    filename = 'FOUND_KEYS.txt' if found else 'all_results.txt'
+    
+    with open(f'results/{filename}', 'a', encoding='utf-8') as f:
+        if found:
+            f.write("="*80 + "\n")
+            f.write(f"BALANCE FOUND!\n")
+            f.write(f"Source data: {data.get('input_data', data.get('block_hash', 'N/A'))}\n")
+            f.write(f"Time: {data['timestamp']}\n\n")
+            
+            if balances['btc']['found']:
+                f.write(f"BITCOIN:\n")
+                f.write(f"Address: {data['btc']['address']}\n")
+                f.write(f"Private key (WIF): {data['btc']['private_key']}\n")
+                f.write(f"Balance: {balances['btc']['balance']} satoshi\n\n")
+            
+            if balances['eth']['found']:
+                eth_balance = balances['eth']['balance'] / 10**18
+                f.write(f"ETHEREUM:\n")
+                f.write(f"Address: {data['eth']['address']}\n")
+                f.write(f"Private key: {data['eth']['private_key']}\n")
+                f.write(f"Balance: {eth_balance} ETH\n\n")
+            
+            f.write("="*80 + "\n\n")
+        else:
+            f.write(f"{data['timestamp']} | Source data: {data.get('input_data', data.get('block_hash', 'N/A'))[:20]}... | ")
+            f.write(f"BTC: {data['btc']['address']} | ETH: {data['eth']['address']} | Balances: BTC={balances['btc']['balance']}, ETH={balances['eth']['balance']/10**18}\n")
+
+def process_address(address, params, position=None):
+    """Optimized address processing with three check methods"""
+    try:
+        print(Fore.CYAN + f"\n[{datetime.now().strftime('%H:%M:%S')}] Processing address: {address}")
+        
+        if position is not None and params.get('file_path'):
+            save_progress(position, os.path.abspath(params['file_path']))
+
+        methods = [
+            ("RAW", address),
+            ("HASHED", hashlib.sha256(address.encode()).hexdigest()),
+            ("HASH_ONLY", hashlib.sha256(address.encode()).hexdigest())
+        ]
+
+        for method_name, data in methods:
+            key_info = generate_key_info(data)
+            if not key_info:
+                continue
+
+            balances = check_balances(key_info)
+            result = {
+                'input_data': f"{method_name}({address})",
+                **key_info,
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            save_result(result, balances)
+            
+            if balances['btc']['found'] or balances['eth']['found']:
+                print_found_balances(address, method_name, key_info, balances)
+
+        if 'BASE_DELAY' in params:
+            time.sleep(params['BASE_DELAY'] * random.uniform(0.8, 1.2))
+            
+        return True
+        
+    except Exception as e:
+        logging.error(f"Address processing error {address}: {str(e)}")
+        return False
+
+def process_address_file(file_path, params):
+    """Process file with BTC addresses"""
+    try:
+        addresses = extract_addresses_from_file(file_path)
+        if not addresses:
+            print(Fore.RED + "Failed to extract addresses from file!")
+            return
+            
+        print(Fore.GREEN + f"\nFound {len(addresses)} addresses to process")
+        
+        # If need to continue from saved position
+        if params.get('resume', False):
+            addresses = addresses[params['resume_pos']:]
+            print(Fore.YELLOW + f"Continuing from position {params['resume_pos']}. {len(addresses)} addresses left")
+        
+        with ThreadPoolExecutor(max_workers=params['MAX_WORKERS']) as executor:
+            futures = {}
+            
+            for idx, addr in enumerate(addresses, start=1):
+                if params.get('resume', False):
+                    position = params['resume_pos'] + idx
+                else:
+                    position = idx
+                
+                futures[executor.submit(process_address, addr, params, position)] = addr
+                
+                # Limit number of concurrent tasks
+                if len(futures) >= params['MAX_WORKERS'] * 2:
+                    for future in as_completed(futures):
+                        addr = futures[future]
+                        try:
+                            future.result()
+                        except Exception as e:
+                            logging.error(f"Address processing error {addr[:10]}...: {str(e)}")
+                        del futures[future]
+                        break
+            
+            # Wait for remaining tasks
+            for future in as_completed(futures):
+                addr = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    logging.error(f"Address processing error {addr[:10]}...: {str(e)}")
+                    
+    except Exception as e:
+        logging.error(f"File processing error: {str(e)}")
+    finally:
+        # Remove progress file after completion
+        if os.path.exists(PROGRESS_FILE):
+            os.remove(PROGRESS_FILE)
+
+def process_block(height, params):
+    """Process single block"""
+    try:
+        print(Fore.CYAN + f"\n[{datetime.now().strftime('%H:%M:%S')}] Processing block: {height}")
+        
+        # Get block hash
+        block_hash = requests.get(
+            f"https://blockchain.info/block-height/{height}?format=json",
+            timeout=10
+        ).json()['blocks'][0]['hash']
+        
+        # Generate keys
+        key_info = generate_key_info(block_hash)
+        if not key_info:
+            return None
+
+        # Check balances
+        balances = check_balances(key_info)
+        
+        # Prepare result
+        result = {
+            'height': height,
+            'block_hash': block_hash,
+            **key_info,
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+        # Save result
+        save_result(result, balances)
+        
+        # Print found balance info
+        if balances['btc']['found'] or balances['eth']['found']:
+            print(Fore.GREEN + Back.BLACK + Style.BRIGHT + "\n" + "="*60)
+            print(Fore.YELLOW + "BALANCE FOUND!")
+            print(Fore.CYAN + f"Block: {height}")
+            print(Fore.CYAN + f"Block hash: {block_hash}")
+            
+            if balances['btc']['found']:
+                print(Fore.GREEN + "\nBITCOIN:")
+                print(Fore.WHITE + f"Address: {key_info['btc']['address']}")
+                print(Fore.WHITE + f"Private key: {key_info['btc']['private_key']}")
+                print(Fore.WHITE + f"Balance: {balances['btc']['balance']} satoshi")
+            
+            if balances['eth']['found']:
+                eth_balance = balances['eth']['balance'] / 10**18
+                print(Fore.BLUE + "\nETHEREUM:")
+                print(Fore.WHITE + f"Address: {key_info['eth']['address']}")
+                print(Fore.WHITE + f"Private key: {key_info['eth']['private_key']}")
+                print(Fore.WHITE + f"Balance: {eth_balance} ETH")
+            
+            print("="*60 + "\n")
+        
+        # Delay
+        if 'BASE_DELAY' in params:
+            time.sleep(params['BASE_DELAY'] * random.uniform(0.8, 1.2))
+            
+        return result
+        
+    except Exception as e:
+        logging.error(f"Block processing error {height}: {str(e)}")
+        return None
+
+def scan_mempool(params):
+    """Scan mempool (unconfirmed transactions)"""
+    try:
+        print(Fore.CYAN + "\nStarting mempool scan...")
+        txids = requests.get("https://blockchain.info/unconfirmed-transactions?format=json", timeout=15).json()['txs']
+        
+        for tx in txids:
+            try:
+                txid = tx['hash']
+                key_info = generate_key_info(txid)
+                if not key_info:
+                    continue
+                    
+                balances = check_balances(key_info)
+                
+                result = {
+                    'txid': txid,
+                    **key_info,
+                    'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                }
+                
+                save_result(result, balances)
+                
+                if balances['btc']['found'] or balances['eth']['found']:
+                    print(Fore.GREEN + Back.BLACK + Style.BRIGHT + "\n" + "="*60)
+                    print(Fore.YELLOW + "BALANCE FOUND IN MEMPOOL!")
+                    print(Fore.CYAN + f"TXID: {txid}")
+                    
+                    if balances['btc']['found']:
+                        print(Fore.GREEN + "\nBITCOIN:")
+                        print(Fore.WHITE + f"Address: {key_info['btc']['address']}")
+                        print(Fore.WHITE + f"Private key: {key_info['btc']['private_key']}")
+                        print(Fore.WHITE + f"Balance: {balances['btc']['balance']} satoshi")
+                    
+                    if balances['eth']['found']:
+                        eth_balance = balances['eth']['balance'] / 10**18
+                        print(Fore.BLUE + "\nETHEREUM:")
+                        print(Fore.WHITE + f"Address: {key_info['eth']['address']}")
+                        print(Fore.WHITE + f"Private key: {key_info['eth']['private_key']}")
+                        print(Fore.WHITE + f"Balance: {eth_balance} ETH")
+                    
+                    print("="*60 + "\n")
+                
+                time.sleep(params['BASE_DELAY'] * random.uniform(0.8, 1.2))
+                
+            except Exception as e:
+                logging.error(f"TXID processing error {txid[:10]}...: {str(e)}")
+                continue
+                
+    except Exception as e:
+        logging.error(f"Mempool scan error: {str(e)}")
+
+def process_hash(custom_hash, params):
+    """Process custom hash"""
+    try:
+        print(Fore.CYAN + f"\nProcessing custom hash: {custom_hash}")
+        
+        key_info = generate_key_info(custom_hash)
+        if not key_info:
+            return None
+
+        balances = check_balances(key_info)
+        
+        result = {
+            'custom_hash': custom_hash,
+            **key_info,
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+        save_result(result, balances)
+        
+        if balances['btc']['found'] or balances['eth']['found']:
+            print(Fore.GREEN + Back.BLACK + Style.BRIGHT + "\n" + "="*60)
+            print(Fore.YELLOW + "BALANCE FOUND!")
+            print(Fore.CYAN + f"Hash: {custom_hash}")
+            
+            if balances['btc']['found']:
+                print(Fore.GREEN + "\nBITCOIN:")
+                print(Fore.WHITE + f"Address: {key_info['btc']['address']}")
+                print(Fore.WHITE + f"Private key: {key_info['btc']['private_key']}")
+                print(Fore.WHITE + f"Balance: {balances['btc']['balance']} satoshi")
+            
+            if balances['eth']['found']:
+                eth_balance = balances['eth']['balance'] / 10**18
+                print(Fore.BLUE + "\nETHEREUM:")
+                print(Fore.WHITE + f"Address: {key_info['eth']['address']}")
+                print(Fore.WHITE + f"Private key: {key_info['eth']['private_key']}")
+                print(Fore.WHITE + f"Balance: {eth_balance} ETH")
+            
+            print("="*60 + "\n")
+        
+        return result
+        
+    except Exception as e:
+        logging.error(f"Hash processing error: {str(e)}")
+        return None
+
+def generate_key_info(data):
+    """Generate BTC and ETH keys from input data"""
+    try:
+        # Generate SHA256 hash
+        if isinstance(data, str):
+            data = data.encode()
+        hash_hex = hashlib.sha256(data).hexdigest()
+        
+        # Generate Bitcoin keys
+        setup('mainnet')
+        priv_key = PrivateKey.from_bytes(bytes.fromhex(hash_hex))
+        wif = priv_key.to_wif()
+        btc_address = priv_key.get_public_key().get_address().to_string()
+
+        # Generate Ethereum keys
+        private_key = "0x" + hash_hex[:64]
+        account = Account.from_key(private_key)
+        eth_address = account.address
+
+        return {
+            'btc': {
+                'private_key': wif,
+                'address': btc_address
+            },
+            'eth': {
+                'private_key': private_key,
+                'address': eth_address
+            },
+            'hash_hex': hash_hex
+        }
+
+    except Exception as e:
+        logging.error(f"Key generation error: {str(e)}")
+        return None
+
+def print_found_balances(source, method, key_info, balances):
+    """Print info about found balances"""
+    print(Fore.GREEN + Back.BLACK + Style.BRIGHT + "\n" + "="*60)
+    print(Fore.YELLOW + f"BALANCE FOUND ({method})!")
+    print(Fore.CYAN + f"Source data: {source}")
+    
+    if balances['btc']['found']:
+        print(Fore.GREEN + "\nBITCOIN:")
+        print(Fore.WHITE + f"Address: {key_info['btc']['address']}")
+        print(Fore.WHITE + f"Private key: {key_info['btc']['private_key']}")
+        print(Fore.WHITE + f"Balance: {balances['btc']['balance']} satoshi")
+    
+    if balances['eth']['found']:
+        eth_balance = balances['eth']['balance'] / 10**18
+        print(Fore.BLUE + "\nETHEREUM:")
+        print(Fore.WHITE + f"Address: {key_info['eth']['address']}")
+        print(Fore.WHITE + f"Private key: {key_info['eth']['private_key']}")
+        print(Fore.WHITE + f"Balance: {eth_balance:.6f} ETH")
+    
+    print("="*60 + "\n")
+
+def process_address_file_from(file_path, params, start_address=None):
+    """Process file with BTC addresses with option to start from specific address"""
+    try:
+        addresses = extract_addresses_from_file(file_path)
+        if not addresses:
+            print(Fore.RED + "Failed to extract addresses from file!")
+            return
+
+        # If start address specified, find its position
+        start_pos = 0
+        if start_address:
+            try:
+                start_pos = addresses.index(start_address)
+                print(Fore.YELLOW + f"\nStarting from address {start_address} (position {start_pos + 1})")
+            except ValueError:
+                print(Fore.RED + f"\nAddress {start_address} not found in file! Starting from beginning.")
+                start_pos = 0
+
+        addresses = addresses[start_pos:]
+        print(Fore.GREEN + f"\nFound {len(addresses)} addresses to process")
+
+        with ThreadPoolExecutor(max_workers=params['MAX_WORKERS']) as executor:
+            futures = {}
+            
+            for idx, addr in enumerate(addresses, start=1):
+                position = start_pos + idx
+                futures[executor.submit(process_address, addr, params, position)] = addr
+                
+                if len(futures) >= params['MAX_WORKERS'] * 2:
+                    for future in as_completed(futures):
+                        addr = futures[future]
+                        try:
+                            future.result()
+                        except Exception as e:
+                            logging.error(f"Address processing error {addr[:10]}...: {str(e)}")
+                        del futures[future]
+                        break
+            
+            for future in as_completed(futures):
+                addr = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    logging.error(f"Address processing error {addr[:10]}...: {str(e)}")
+                    
+    except Exception as e:
+        logging.error(f"File processing error: {str(e)}")
+    finally:
+        if os.path.exists(PROGRESS_FILE):
+            os.remove(PROGRESS_FILE)
+
+def main():
+    # Environment setup
+    print_banner()
+    setup('mainnet')
+    setup_logging()
+    
+    try:
+        while True:
+            params = get_user_input()
+            print_config(params)
+            
+            if params['mode'] == 'custom':
+                result = process_hash(params['custom_hash'], params)
+                if result:
+                    balances = check_balances(result)
+                    if balances['btc']['found'] or balances['eth']['found']:
+                        print(Fore.GREEN + Back.BLACK + Style.BRIGHT +
+                             f"\nFOUND FUNDS IN HASH {params['custom_hash'][:12]}...!")
+            
+            elif params['mode'] == 'address_file':
+                # Add option to start from specific address
+                if input(Fore.YELLOW + "Start from specific address in file? (y/n): ").lower() == 'y':
+                    start_addr = input(Fore.GREEN + "Enter address to start from: ").strip()
+                    process_address_file_from(params['file_path'], params, start_addr)
+                else:
+                    process_address_file(params['file_path'], params)
+                
+            elif params['mode'] == 'blocks':
+                with ThreadPoolExecutor(max_workers=params['MAX_WORKERS']) as executor:
+                    futures = {}
+                    
+                    for height in params['blocks']:
+                        futures[executor.submit(process_block, height, params)] = height
+                    
+                    if params.get('SCAN_MEMPOOL', False):
+                        futures[executor.submit(scan_mempool, params)] = "mempool"
+                    
+                    for future in as_completed(futures):
+                        task = futures[future]
+                        try:
+                            result = future.result()
+                            if result and isinstance(task, int):
+                                balances = check_balances(result)
+                                if balances['btc']['found'] or balances['eth']['found']:
+                                    print(Fore.GREEN + Back.BLACK + Style.BRIGHT +
+                                         f"\nFOUND FUNDS IN BLOCK {task}!")
+                        except Exception as e:
+                            logging.error(f"Block error {task}: {str(e)}")
+                
+            if input(Fore.YELLOW + "\nContinue working? (y/n): ").lower() != 'y':
+                break
+                
+    except KeyboardInterrupt:
+        print(Fore.RED + "\nScanning interrupted by user")
+    except Exception as e:
+        logging.error(f"Critical error: {str(e)}")
+    finally:
+        print(Fore.GREEN + "\nScanning completed. Results saved in 'results' folder")
+
+if __name__ == "__main__":
+    main()
