@@ -5,8 +5,9 @@ import time
 import random
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from bitcoinutils.setup import setup
-from bitcoinutils.keys import PrivateKey
+from ecdsa import SigningKey, SECP256k1
+import hashlib
+import base58
 import logging
 from datetime import datetime
 from colorama import init, Fore, Back, Style
@@ -559,31 +560,44 @@ def process_hash(custom_hash, params):
 def generate_key_info(data):
     """
     Create BTC keys (compressed & uncompressed) + ETH key
+    без использования bitcoinutils.
     """
     try:
+        # 1) Получаем SHA256-хеш входных данных
         if isinstance(data, str):
             data = data.encode()
         hash_hex = hashlib.sha256(data).hexdigest()
 
-        setup('mainnet')
+        # 2) Генерируем ECDSA-приватный ключ из hash_hex
+        priv_bytes = bytes.fromhex(hash_hex)
+        sk = SigningKey.from_string(priv_bytes, curve=SECP256k1)
+        vk = sk.get_verifying_key()
 
-        # Сжатый (compressed) приватный ключ
-        priv_c = PrivateKey(hash_hex, compressed=True)
-        addr_c = priv_c.get_public_key().get_address().to_string()
+        # 3) Несжатый публичный ключ (0x04 + X + Y)
+        pub_uncompressed = b'\x04' + vk.to_string()
+        # P2PKH-адрес (Bitcoin mainnet) из несжатого PK
+        addr_uncmp = pubkey_to_p2pkh(pub_uncompressed)
 
-        # Несжатый (uncompressed) приватный ключ
-        priv_u = PrivateKey(hash_hex, compressed=False)
-        addr_u = priv_u.get_public_key().get_address().to_string()
+        # 4) Сжатый публичный ключ: 
+        #    если Y последнего байта чётный → 0x02, иначе 0x03, + X
+        x_bytes = vk.to_string()[:32]
+        y_bytes = vk.to_string()[32:]
+        prefix = b'\x02' if (y_bytes[-1] % 2 == 0) else b'\x03'
+        pub_compressed = prefix + x_bytes
+        addr_cmp = pubkey_to_p2pkh(pub_compressed)
 
-        # Ethereum-ключ
+        # 5) Приватный ключ в WIF (compressed)
+        wif = private_key_to_wif(priv_bytes, compressed=True)
+
+        # 6) Ethereum-ключ (остается как было)
         eth_priv = "0x" + hash_hex[:64]
         eth_addr = Account.from_key(eth_priv).address
 
         return {
             'btc': {
-                'private_key': priv_c.to_wif(),     # WIF всегда в compressed-формате
-                'address_compressed': addr_c,
-                'address_uncompressed': addr_u
+                'private_key': wif,
+                'address_compressed': addr_cmp,
+                'address_uncompressed': addr_uncmp
             },
             'eth': {
                 'private_key': eth_priv,
@@ -595,6 +609,31 @@ def generate_key_info(data):
     except Exception as e:
         logging.error(f"Key generation error: {e}")
         return None
+
+
+def pubkey_to_p2pkh(pubkey_bytes: bytes) -> str:
+    """
+    Конвертируем публичный ключ (bytes) в P2PKH-адрес (Base58Check).
+    """
+    sha = hashlib.sha256(pubkey_bytes).digest()
+    ripemd = hashlib.new('ripemd160', sha).digest()
+    prefix = b'\x00'  # mainnet
+    payload = prefix + ripemd
+    checksum = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+    return base58.b58encode(payload + checksum).decode()
+
+
+def private_key_to_wif(priv_bytes: bytes, compressed: bool = True) -> str:
+    """
+    Конвертируем raw-приватный ключ (32 байта) в WIF (Base58Check).
+    Если compressed=True, добавляем байт 0x01 перед контрольной суммой.
+    """
+    prefix = b'\x80'
+    suffix = b'\x01' if compressed else b''
+    payload = prefix + priv_bytes + suffix
+    checksum = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+    return base58.b58encode(payload + checksum).decode()
+
 
 def print_found_balances(source, method, key_info, balances):
     """Print info about found balances"""
