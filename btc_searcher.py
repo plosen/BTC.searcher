@@ -521,39 +521,45 @@ def process_hash(custom_hash, params):
         return None
 
 def generate_key_info(data):
-    """Generate BTC and ETH keys from input data"""
+    """
+    Create BTC keys (compressed & uncompressed) + ETH key
+    """
     try:
-        # Generate SHA256 hash
         if isinstance(data, str):
             data = data.encode()
         hash_hex = hashlib.sha256(data).hexdigest()
-        
-        # Generate Bitcoin keys
-        setup('mainnet')
-        priv_key = PrivateKey.from_bytes(bytes.fromhex(hash_hex))
-        wif = priv_key.to_wif()
-        btc_address = priv_key.get_public_key().get_address().to_string()
 
-        # Generate Ethereum keys
-        private_key = "0x" + hash_hex[:64]
-        account = Account.from_key(private_key)
-        eth_address = account.address
+        setup('mainnet')
+
+        # compressed
+        priv_c = PrivateKey.from_bytes(bytes.fromhex(hash_hex), compressed=True)
+        addr_c = priv_c.get_public_key().get_address().to_string()
+
+        # uncompressed
+        priv_u = PrivateKey.from_bytes(bytes.fromhex(hash_hex), compressed=False)
+        addr_u = priv_u.get_public_key().get_address().to_string()
+
+        # ETH
+        eth_priv = "0x" + hash_hex[:64]
+        eth_addr = Account.from_key(eth_priv).address
 
         return {
             'btc': {
-                'private_key': wif,
-                'address': btc_address
+                'private_key': priv_c.to_wif(),     # WIF всегда в compressed-форме
+                'address_compressed': addr_c,
+                'address_uncompressed': addr_u
             },
             'eth': {
-                'private_key': private_key,
-                'address': eth_address
+                'private_key': eth_priv,
+                'address': eth_addr
             },
             'hash_hex': hash_hex
         }
 
     except Exception as e:
-        logging.error(f"Key generation error: {str(e)}")
+        logging.error(f"Key generation error: {e}")
         return None
+
 
 def print_found_balances(source, method, key_info, balances):
     """Print info about found balances"""
