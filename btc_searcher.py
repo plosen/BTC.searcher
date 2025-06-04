@@ -701,7 +701,7 @@ def process_address_file_from(file_path, params, start_address=None):
 def main():
     # Environment setup
     print_banner()
-    setup('mainnet')
+    #setup('mainnet')
     setup_logging()
 
     try:
