@@ -221,54 +221,65 @@ def check_eth_balance(address):
         return 0, False
 
 def check_balances(key_info):
-    """Check BTC and ETH balances"""
+    """Check BTC (both compressed & uncompressed) and ETH balances"""
     results = {
         'btc': {'balance': 0, 'found': False},
         'eth': {'balance': 0, 'found': False}
     }
-    
-    btc_balance, btc_found = check_btc_balance(key_info['btc']['address'])
-    results['btc']['balance'] = btc_balance
-    results['btc']['found'] = btc_found
-    
+
+    # Проверяем сжатый адрес
+    btc_balance_c, btc_found_c = check_btc_balance(key_info['btc']['address_compressed'])
+    # Проверяем несжатый адрес
+    btc_balance_u, btc_found_u = check_btc_balance(key_info['btc']['address_uncompressed'])
+
+    results['btc']['balance'] = btc_balance_c + btc_balance_u
+    results['btc']['found'] = btc_found_c or btc_found_u
+
+    # Ethereum как было
     eth_balance, eth_found = check_eth_balance(key_info['eth']['address'])
     results['eth']['balance'] = eth_balance
     results['eth']['found'] = eth_found
-    
+
     return results
+
 
 def save_result(data, balances):
     """Save results to file"""
     if not os.path.exists('results'):
         os.makedirs('results')
-    
+
     found = balances['btc']['found'] or balances['eth']['found']
     filename = 'FOUND_KEYS.txt' if found else 'all_results.txt'
-    
+
     with open(f'results/{filename}', 'a', encoding='utf-8') as f:
         if found:
             f.write("="*80 + "\n")
             f.write(f"BALANCE FOUND!\n")
             f.write(f"Source data: {data.get('input_data', data.get('block_hash', 'N/A'))}\n")
             f.write(f"Time: {data['timestamp']}\n\n")
-            
+
             if balances['btc']['found']:
                 f.write(f"BITCOIN:\n")
-                f.write(f"Address: {data['btc']['address']}\n")
+                f.write(f"Compressed Address: {data['btc']['address_compressed']}\n")
+                f.write(f"Uncompressed Address: {data['btc']['address_uncompressed']}\n")
                 f.write(f"Private key (WIF): {data['btc']['private_key']}\n")
                 f.write(f"Balance: {balances['btc']['balance']} satoshi\n\n")
-            
+
             if balances['eth']['found']:
                 eth_balance = balances['eth']['balance'] / 10**18
                 f.write(f"ETHEREUM:\n")
                 f.write(f"Address: {data['eth']['address']}\n")
                 f.write(f"Private key: {data['eth']['private_key']}\n")
                 f.write(f"Balance: {eth_balance} ETH\n\n")
-            
+
             f.write("="*80 + "\n\n")
         else:
             f.write(f"{data['timestamp']} | Source data: {data.get('input_data', data.get('block_hash', 'N/A'))[:20]}... | ")
-            f.write(f"BTC: {data['btc']['address']} | ETH: {data['eth']['address']} | Balances: BTC={balances['btc']['balance']}, ETH={balances['eth']['balance']/10**18}\n")
+            f.write(f"BTC (compressed): {data['btc']['address_compressed']} | ")
+            f.write(f"BTC (uncompressed): {data['btc']['address_uncompressed']} | ")
+            f.write(f"ETH: {data['eth']['address']} | ")
+            f.write(f"Balances: BTC={balances['btc']['balance']}, ETH={balances['eth']['balance']/10**18}\n")
+
 
 def process_address(address, params, position=None):
     """Optimized address processing with three check methods"""
@@ -400,9 +411,11 @@ def process_block(height, params):
             
             if balances['btc']['found']:
                 print(Fore.GREEN + "\nBITCOIN:")
-                print(Fore.WHITE + f"Address: {key_info['btc']['address']}")
+                print(Fore.WHITE + f"Compressed Address: {key_info['btc']['address_compressed']}")
+                print(Fore.WHITE + f"Uncompressed Address: {key_info['btc']['address_uncompressed']}")
                 print(Fore.WHITE + f"Private key: {key_info['btc']['private_key']}")
                 print(Fore.WHITE + f"Balance: {balances['btc']['balance']} satoshi")
+
             
             if balances['eth']['found']:
                 eth_balance = balances['eth']['balance'] / 10**18
@@ -453,9 +466,11 @@ def scan_mempool(params):
                     
                     if balances['btc']['found']:
                         print(Fore.GREEN + "\nBITCOIN:")
-                        print(Fore.WHITE + f"Address: {key_info['btc']['address']}")
+                        print(Fore.WHITE + f"Compressed Address: {key_info['btc']['address_compressed']}")
+                        print(Fore.WHITE + f"Uncompressed Address: {key_info['btc']['address_uncompressed']}")
                         print(Fore.WHITE + f"Private key: {key_info['btc']['private_key']}")
                         print(Fore.WHITE + f"Balance: {balances['btc']['balance']} satoshi")
+
                     
                     if balances['eth']['found']:
                         eth_balance = balances['eth']['balance'] / 10**18
@@ -501,9 +516,11 @@ def process_hash(custom_hash, params):
             
             if balances['btc']['found']:
                 print(Fore.GREEN + "\nBITCOIN:")
-                print(Fore.WHITE + f"Address: {key_info['btc']['address']}")
+                print(Fore.WHITE + f"Compressed Address: {key_info['btc']['address_compressed']}")
+                print(Fore.WHITE + f"Uncompressed Address: {key_info['btc']['address_uncompressed']}")
                 print(Fore.WHITE + f"Private key: {key_info['btc']['private_key']}")
                 print(Fore.WHITE + f"Balance: {balances['btc']['balance']} satoshi")
+
             
             if balances['eth']['found']:
                 eth_balance = balances['eth']['balance'] / 10**18
@@ -531,15 +548,15 @@ def generate_key_info(data):
 
         setup('mainnet')
 
-        # compressed
+        # Сжатый (compressed) приватный ключ
         priv_c = PrivateKey.from_bytes(bytes.fromhex(hash_hex), compressed=True)
         addr_c = priv_c.get_public_key().get_address().to_string()
 
-        # uncompressed
+        # Несжатый (uncompressed) приватный ключ
         priv_u = PrivateKey.from_bytes(bytes.fromhex(hash_hex), compressed=False)
         addr_u = priv_u.get_public_key().get_address().to_string()
 
-        # ETH
+        # Ethereum-ключ
         eth_priv = "0x" + hash_hex[:64]
         eth_addr = Account.from_key(eth_priv).address
 
@@ -566,21 +583,23 @@ def print_found_balances(source, method, key_info, balances):
     print(Fore.GREEN + Back.BLACK + Style.BRIGHT + "\n" + "="*60)
     print(Fore.YELLOW + f"BALANCE FOUND ({method})!")
     print(Fore.CYAN + f"Source data: {source}")
-    
+
     if balances['btc']['found']:
         print(Fore.GREEN + "\nBITCOIN:")
-        print(Fore.WHITE + f"Address: {key_info['btc']['address']}")
+        print(Fore.WHITE + f"Compressed Address: {key_info['btc']['address_compressed']}")
+        print(Fore.WHITE + f"Uncompressed Address: {key_info['btc']['address_uncompressed']}")
         print(Fore.WHITE + f"Private key: {key_info['btc']['private_key']}")
         print(Fore.WHITE + f"Balance: {balances['btc']['balance']} satoshi")
-    
+
     if balances['eth']['found']:
         eth_balance = balances['eth']['balance'] / 10**18
         print(Fore.BLUE + "\nETHEREUM:")
         print(Fore.WHITE + f"Address: {key_info['eth']['address']}")
         print(Fore.WHITE + f"Private key: {key_info['eth']['private_key']}")
         print(Fore.WHITE + f"Balance: {eth_balance:.6f} ETH")
-    
+
     print("="*60 + "\n")
+
 
 def process_address_file_from(file_path, params, start_address=None):
     """Process file with BTC addresses with option to start from specific address"""
